@@ -1,72 +1,100 @@
-// pages/api/checkout.js
-// Stripe Checkout session creator
-// Requires: STRIPE_SECRET_KEY, NEXT_PUBLIC_APP_URL in environment
+// pages/api/checkout.js — bulletproof Stripe checkout, no SDK
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" })
   }
 
+  // ── 1. Validate Stripe key ──────────────────────────────────────────────
   const stripeKey = process.env.STRIPE_SECRET_KEY
-  if (!stripeKey) {
+  if (!stripeKey || stripeKey === "sk_test_your-stripe-secret-key") {
     return res.status(500).json({
-      error: "Stripe not configured — add STRIPE_SECRET_KEY in Vercel Settings → Environment Variables"
+      error: "STRIPE_SECRET_KEY not configured in Vercel → Settings → Environment Variables"
     })
   }
 
-  const { priceId, tierId, email } = req.body ?? {}
+  // ── 2. Parse body ───────────────────────────────────────────────────────
+  const { tierId } = req.body ?? {}
 
-  if (!priceId) {
-    return res.status(400).json({ error: "priceId is required" })
+  if (!tierId) {
+    return res.status(400).json({ error: "tierId is required" })
   }
 
-  const appUrl = process.env.NEXT_PUBLIC_APP_URL || "https://vaultiq.vercel.app"
+  // ── 3. Map tier → price ID from server env vars ─────────────────────────
+  // NOTE: Using server-side env vars (no NEXT_PUBLIC_ prefix) so they are
+  // resolved at runtime on the server, not at build time on the client.
+  const PRICE_MAP = {
+    starter: process.env.STRIPE_PRICE_STARTER || process.env.NEXT_PUBLIC_STRIPE_PRICE_STARTER,
+    pro:     process.env.STRIPE_PRICE_PRO     || process.env.NEXT_PUBLIC_STRIPE_PRICE_PRO,
+    agency:  process.env.STRIPE_PRICE_AGENCY  || process.env.NEXT_PUBLIC_STRIPE_PRICE_AGENCY,
+  }
 
-  // Only include customer_email if it looks like a real email — empty string causes Stripe 400
-  const validEmail = typeof email === "string" && email.includes("@") && email.includes(".") ? email : null
+  const priceId = PRICE_MAP[tierId]
 
-  // Build params object — conditionally add optional fields
+  console.log("[VaultIQ Checkout] tierId:", tierId, "| priceId:", priceId)
+
+  if (!priceId || priceId === "undefined" || priceId === "null" || !priceId.startsWith("price_")) {
+    return res.status(400).json({
+      error: `Price ID for "${tierId}" is not configured. Go to Vercel → Settings → Environment Variables and add STRIPE_PRICE_${tierId.toUpperCase()} = price_xxx`
+    })
+  }
+
+  // ── 4. Build Stripe params ──────────────────────────────────────────────
+  const appUrl = (process.env.NEXT_PUBLIC_APP_URL || "").replace(/\/$/, "") || "https://vaultiq.vercel.app"
+
   const params = {
-    "mode": "subscription",
-    "line_items[0][price]": priceId,
-    "line_items[0][quantity]": "1",
-    "success_url": `${appUrl}/success?tier=${tierId}&session_id={CHECKOUT_SESSION_ID}`,
-    "cancel_url": `${appUrl}/?checkout=cancelled`,
-    "allow_promotion_codes": "true",
-    "billing_address_collection": "auto",
+    "mode":                          "subscription",
+    "line_items[0][price]":          priceId,
+    "line_items[0][quantity]":       "1",
+    "success_url":                   `${appUrl}/success?tier=${tierId}&session_id={CHECKOUT_SESSION_ID}`,
+    "cancel_url":                    `${appUrl}/`,
+    "allow_promotion_codes":         "true",
+    "billing_address_collection":    "auto",
   }
 
-  // Only add customer_email when valid — Stripe rejects empty strings and malformed emails
-  if (validEmail) params["customer_email"] = validEmail
-
-  // Only add coupon when env var is set
-  if (process.env.STRIPE_BETA_COUPON) {
-    params["discounts[0][coupon]"] = process.env.STRIPE_BETA_COUPON
+  // Only add coupon when env var is set AND non-empty
+  const coupon = process.env.STRIPE_BETA_COUPON
+  if (coupon && coupon.trim() && coupon !== "FOUNDING50_COUPON_ID_HERE") {
+    params["discounts[0][coupon]"] = coupon.trim()
+    console.log("[VaultIQ Checkout] Applying coupon:", coupon)
   }
 
+  console.log("[VaultIQ Checkout] Params:", JSON.stringify(params))
+
+  // ── 5. Call Stripe ──────────────────────────────────────────────────────
+  let response
   try {
-    const response = await fetch("https://api.stripe.com/v1/checkout/sessions", {
+    response = await fetch("https://api.stripe.com/v1/checkout/sessions", {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${stripeKey}`,
-        "Content-Type": "application/x-www-form-urlencoded",
+        "Authorization":  `Bearer ${stripeKey}`,
+        "Content-Type":   "application/x-www-form-urlencoded",
       },
       body: new URLSearchParams(params).toString(),
     })
-
-    const session = await response.json()
-
-    if (!response.ok) {
-      console.error("[VaultIQ Stripe] Error:", session.error)
-      return res.status(500).json({
-        error: session.error?.message || `Stripe error ${response.status}`
-      })
-    }
-
-    return res.status(200).json({ url: session.url, sessionId: session.id })
-
-  } catch (err) {
-    console.error("[VaultIQ Stripe] Network error:", err.message)
-    return res.status(502).json({ error: "Could not reach Stripe — retry in a moment." })
+  } catch (networkErr) {
+    console.error("[VaultIQ Checkout] Network error:", networkErr.message)
+    return res.status(502).json({ error: "Could not reach Stripe — check your network and retry." })
   }
+
+  // ── 6. Handle Stripe response ───────────────────────────────────────────
+  let session
+  try {
+    session = await response.json()
+  } catch {
+    return res.status(500).json({ error: "Invalid response from Stripe." })
+  }
+
+  if (!response.ok) {
+    const errMsg = session?.error?.message || `Stripe error ${response.status}`
+    console.error("[VaultIQ Checkout] Stripe error:", response.status, errMsg, JSON.stringify(session?.error))
+    return res.status(500).json({ error: errMsg })
+  }
+
+  if (!session.url) {
+    return res.status(500).json({ error: "Stripe returned no checkout URL." })
+  }
+
+  console.log("[VaultIQ Checkout] Session created:", session.id)
+  return res.status(200).json({ url: session.url, sessionId: session.id })
 }

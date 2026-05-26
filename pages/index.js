@@ -114,11 +114,12 @@ export default function LandingPage() {
       const res = await fetch("/api/checkout", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ priceId: tier.priceId, tierId: tier.id }),
+        body: JSON.stringify({ tierId: tier.id }),
       })
-      const { url, error } = await res.json()
-      if (error) throw new Error(error)
-      window.location.href = url
+      const data = await res.json()
+      if (!res.ok || data.error) throw new Error(data.error || "Server error " + res.status)
+      if (!data.url) throw new Error("No checkout URL returned")
+      window.location.href = data.url
     } catch (err) {
       alert("Checkout error: " + err.message)
     } finally {
