@@ -14,7 +14,7 @@ export default async function handler(req, res) {
     })
   }
 
-  const { priceId, tierId } = req.body ?? {}
+  const { priceId, tierId, email } = req.body ?? {}
 
   if (!priceId) {
     return res.status(400).json({ error: "priceId is required" })
@@ -22,30 +22,36 @@ export default async function handler(req, res) {
 
   const appUrl = process.env.NEXT_PUBLIC_APP_URL || "https://vaultiq.vercel.app"
 
+  // Only include customer_email if it looks like a real email — empty string causes Stripe 400
+  const validEmail = typeof email === "string" && email.includes("@") && email.includes(".") ? email : null
+
+  // Build params object — conditionally add optional fields
+  const params = {
+    "mode": "subscription",
+    "line_items[0][price]": priceId,
+    "line_items[0][quantity]": "1",
+    "success_url": `${appUrl}/success?tier=${tierId}&session_id={CHECKOUT_SESSION_ID}`,
+    "cancel_url": `${appUrl}/?checkout=cancelled`,
+    "allow_promotion_codes": "true",
+    "billing_address_collection": "auto",
+  }
+
+  // Only add customer_email when valid — Stripe rejects empty strings and malformed emails
+  if (validEmail) params["customer_email"] = validEmail
+
+  // Only add coupon when env var is set
+  if (process.env.STRIPE_BETA_COUPON) {
+    params["discounts[0][coupon]"] = process.env.STRIPE_BETA_COUPON
+  }
+
   try {
-    // Call Stripe API directly — no SDK needed
     const response = await fetch("https://api.stripe.com/v1/checkout/sessions", {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${stripeKey}`,
         "Content-Type": "application/x-www-form-urlencoded",
       },
-      body: new URLSearchParams({
-        "mode": "subscription",
-        "line_items[0][price]": priceId,
-        "line_items[0][quantity]": "1",
-        "success_url": `${appUrl}/success?tier=${tierId}&session_id={CHECKOUT_SESSION_ID}`,
-        "cancel_url": `${appUrl}/?checkout=cancelled`,
-        "allow_promotion_codes": "true",
-        "billing_address_collection": "auto",
-        "customer_email": req.body.email || "",
-        // Collect trial period — 14-day money-back equivalent
-        "subscription_data[trial_period_days]": "0",
-        // Beta coupon applied automatically if STRIPE_BETA_COUPON set
-        ...(process.env.STRIPE_BETA_COUPON
-          ? { "discounts[0][coupon]": process.env.STRIPE_BETA_COUPON }
-          : {}),
-      }).toString(),
+      body: new URLSearchParams(params).toString(),
     })
 
     const session = await response.json()
